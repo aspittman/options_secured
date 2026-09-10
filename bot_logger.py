@@ -19,4 +19,4 @@ def setup_logging():
 
 
 def bot_log(message, level=logging.INFO):
-    logging.getLogger("options_bot").log(level, message)
+    logging.getLogger("cash_secured_put").log(level, message)

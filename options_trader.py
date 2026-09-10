@@ -1,5 +1,6 @@
 """Alpaca adapter and paper execution lifecycle for cash-secured puts."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING
 import math
@@ -17,8 +18,8 @@ from alpaca.trading.requests import GetOptionContractsRequest, GetOrdersRequest,
 
 from analytics import TERMINAL
 from bot_logger import bot_log
-from config import credentials
-from risk import capacity
+from config import credentials, STRATEGY_ID
+from risk import capacity, parse_option, virtual_capacity
 from strategy import bearish_at, exit_reason, indicators
 
 NY = ZoneInfo("America/New_York")
@@ -33,6 +34,7 @@ class Candidate:
     bid: float
     ask: float
     delta: float = -0.25
+    underlying_price: float | None = None
 
 
 def valid_quote(quote, max_age, now=None, for_exit=False):
@@ -81,7 +83,24 @@ class AlpacaBroker:
     def cancel(self, broker_id):
         self.trading.cancel_order_by_id(broker_id)
 
+    def settlement_activities(self, after):
+        # Alpaca-py exposes the REST GET helper; retrieve all pages, then match
+        # option ownership and paired stock delivery before changing our ledger.
+        params={'activity_types':'OPASN,OPEXP,OPTRD','after':after,'direction':'asc','page_size':100}
+        rows=[]
+        while True:
+            page=self.trading.get('/account/activities',data=params)
+            if not isinstance(page,list):
+                raise ValueError('Invalid settlement activity response')
+            rows.extend(page)
+            if len(page)<100:
+                return rows
+            params['page_token']=page[-1]['id']
+
     def submit(self, candidate, qty, side, price, client_id):
+        parsed=parse_option(candidate.symbol)
+        if qty!=1 or not parsed or parsed['kind']!='P' or side not in {'sell','buy'}:
+            raise ValueError('Alpaca adapter accepts only one short-put contract or its buyback')
         return self.trading.submit_order(order_data=LimitOrderRequest(
             symbol=candidate.symbol, qty=qty, side=OrderSide(side),
             position_intent=PositionIntent.SELL_TO_OPEN if side == "sell" else PositionIntent.BUY_TO_CLOSE,
@@ -123,11 +142,17 @@ class AlpacaBroker:
         except Exception:
             return False
 
+    def reject_candidate(self, reason, candidate=None, **details):
+        sink = getattr(self, "rejection_sink", None)
+        if sink:
+            sink(reason, candidate, **details)
+
     def candidates(self, underlying):
         cfg = self.cfg
         today = datetime.now(NY).date()
         latest = self.stocks.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=underlying, feed=DataFeed.IEX))[underlying]
         if not -5 <= (datetime.now(timezone.utc) - latest.timestamp).total_seconds() <= cfg.quote_max_age:
+            bot_log(f"CONTRACT SCAN {underlying}: stale underlying trade")
             return []
         spot = float(latest.price)
         if not math.isfinite(spot) or spot <= 0:
@@ -145,14 +170,19 @@ class AlpacaBroker:
                 break
             request.page_token = response.next_page_token
         eligible = []
+        rejected = Counter()
         for contract in contracts:
             strike = float(contract.strike_price)
             if (contract.tradable and str(getattr(contract.type, "value", contract.type)) == "put"
                 and float(contract.size or 0) == 100 and contract.root_symbol == underlying
-                and 0 < strike < spot and strike * 100 <= cfg.max_collateral_per_trade
+                and 0 < strike < spot
                 and float(contract.open_interest or 0) >= cfg.min_open_interest
                 and cfg.min_dte <= (contract.expiration_date - today).days <= cfg.max_dte):
                 eligible.append(contract)
+            else:
+                self.reject_candidate("INSUFFICIENT_LIQUIDITY" if float(contract.open_interest or 0)<cfg.min_open_interest else "NO_VALID_CONTRACT",
+                    Candidate(contract.symbol,underlying,strike,contract.expiration_date,0,0,underlying_price=spot),
+                    details="contract metadata/open-interest filter; unavailable quote fields are zero")
         ranked = []
         for start in range(0, len(eligible), 100):
             batch = eligible[start:start + 100]
@@ -166,16 +196,35 @@ class AlpacaBroker:
                 quote = getattr(snap, "latest_quote", None)
                 delta = getattr(getattr(snap, "greeks", None), "delta", None)
                 volume = sum(float(b.volume) for b in volumes.get(contract.symbol, []))
-                if not valid_quote(quote, cfg.quote_max_age) or delta is None:
+                raw = Candidate(contract.symbol, underlying, float(contract.strike_price), contract.expiration_date,
+                    float(getattr(quote,'bid_price',0) or 0), float(getattr(quote,'ask_price',0) or 0), underlying_price=spot)
+                if not valid_quote(quote, cfg.quote_max_age):
+                    self.reject_candidate("OTHER", raw, details="quote unavailable, invalid, or stale")
+                    rejected["quote_unavailable_or_stale"] += 1
+                    continue
+                if delta is None:
+                    self.reject_candidate("NO_VALID_CONTRACT", raw, details="missing delta")
+                    rejected["missing_delta"] += 1
                     continue
                 delta = float(delta)
                 bid, ask = float(quote.bid_price), float(quote.ask_price)
                 strike = float(contract.strike_price)
-                if (not math.isfinite(delta) or delta >= 0 or abs(delta - cfg.target_delta) > cfg.delta_tolerance
-                    or (ask - bid) / ((ask + bid) / 2) > cfg.max_spread
-                    or volume < cfg.min_volume or bid / strike < cfg.min_credit_yield):
+                failures = {
+                    "delta": not math.isfinite(delta) or delta >= 0 or abs(delta - cfg.target_delta) > cfg.delta_tolerance,
+                    "spread": (ask - bid) / ((ask + bid) / 2) > cfg.max_spread,
+                    "volume": volume < cfg.min_volume,
+                    "credit_yield": bid / strike < cfg.min_credit_yield,
+                }
+                rejected.update(name for name, failed in failures.items() if failed)
+                if any(failures.values()):
+                    reason = ("NO_VALID_CONTRACT" if failures['delta'] else "SPREAD_TOO_WIDE" if failures['spread']
+                              else "INSUFFICIENT_LIQUIDITY" if failures['volume'] else "NO_VALID_CONTRACT")
+                    self.reject_candidate(reason, raw, details=','.join(k for k,v in failures.items() if v))
                     continue
-                ranked.append(Candidate(contract.symbol, underlying, strike, contract.expiration_date, bid, ask, delta))
+                ranked.append(Candidate(contract.symbol, underlying, strike, contract.expiration_date, bid, ask, delta, spot))
+        bot_log(f"CONTRACT SCAN {underlying}: chain={len(contracts)} metadata_pass={len(eligible)} "
+                f"qualified={len(ranked)} rejected_filters={dict(rejected)} "
+                f"collateral_cap=${cfg.max_collateral_per_trade:,.0f}")
         return sorted(ranked, key=lambda c: (abs(c.delta - cfg.target_delta), (c.ask - c.bid) / c.ask, c.strike))
 
 
@@ -188,13 +237,27 @@ class Trader:
         for row in self.ledger.pending():
             try:
                 order = self.broker.lookup(row["client_id"])
+                parsed = parse_option(row['symbol'])
+                if (not parsed or parsed['kind']!='P' or getattr(order,'symbol',None)!=row['symbol']
+                    or getattr(order,'client_order_id',None)!=row['client_id']
+                    or str(getattr(order.side,'value',order.side))!=row['side']):
+                    raise ValueError("Broker order ownership/type mismatch")
                 status = str(getattr(order.status, "value", order.status))
                 self.ledger.reconcile(row["client_id"], str(order.id), status,
                                       float(order.filled_qty or 0), float(order.filled_avg_price or 0))
+                if status=='rejected' and row['side']=='sell':
+                    candidate=Candidate(row['symbol'],row['underlying'],row['strike'],date.fromisoformat(row['expiry']),0,0)
+                    self.reject('OTHER',candidate,row['strategy'],row['signal_date'],'broker rejected order '+row['client_id'])
                 age = (datetime.now(timezone.utc) - datetime.fromisoformat(row["created"])).total_seconds()
                 timeout = self.cfg.entry_timeout if row["side"] == "sell" else self.cfg.exit_timeout
-                if status not in TERMINAL and age >= timeout:
+                violates_allocation = row['side']=='sell' and (
+                    row['qty']>self.cfg.max_contracts_per_trade
+                    or row['strike']*row['qty']*100>min(self.cfg.max_collateral_per_trade,self.cfg.virtual_starting_capital)
+                    or self.ledger.reserved()>min(self.cfg.max_total_collateral,self.cfg.virtual_starting_capital))
+                if status not in TERMINAL and (age >= timeout or violates_allocation):
                     self.broker.cancel(str(order.id))
+                    if violates_allocation:
+                        bot_log(f'{STRATEGY_ID}: cancelling own pending entry outside virtual allocation: {row["client_id"]}')
                     # Keep reserves and pending status until cancellation is confirmed.
             except Exception as exc:
                 healthy = False
@@ -204,6 +267,19 @@ class Trader:
         for symbol, lot in self.ledger.lots().items():
             actual = float(positions[symbol].qty) if symbol in positions else 0
             if actual != -lot["qty"] and symbol not in pending_symbols:
+                if hasattr(self.broker,'settlement_activities'):
+                    try:
+                        opened=self.ledger.db.execute("SELECT MIN(created) FROM orders WHERE symbol=?",(symbol,)).fetchone()[0]
+                        activities=self.broker.settlement_activities(opened[:10])
+                        for activity in activities:
+                            if activity.get('symbol')!=symbol or float(activity.get('qty',0))!=lot['qty']+actual:
+                                continue
+                            pairs=[a for a in activities if a.get('activity_type')=='OPTRD' and a.get('symbol')==lot['underlying'] and a.get('date')==activity.get('date') and float(a.get('qty',0))==float(activity.get('qty',0))*100 and float(a.get('price',0))==lot['strike']]
+                            self.ledger.settlement(activity,pairs[0] if len(pairs)==1 else None)
+                        if actual==-self.ledger.lots().get(symbol,{'qty':0})['qty']:
+                            continue
+                    except Exception as exc:
+                        bot_log(f'Settlement reconciliation unavailable for {symbol}: {exc}')
                 healthy = False
                 if not self.ledger.blocked():
                     self.ledger.event("RECONCILIATION_REQUIRED", symbol, expected=-lot["qty"], actual=actual,
@@ -212,7 +288,25 @@ class Trader:
         return healthy and not self.ledger.blocked()
 
     def submit(self, candidate, strategy, side, qty, price, signal_date=""):
-        client_id = f"os-{uuid4().hex}"
+        parsed = parse_option(candidate.symbol)
+        if not parsed or parsed['kind']!='P' or parsed['underlying']!=candidate.underlying or parsed['strike']!=candidate.strike or side not in {'sell','buy'}:
+            return self.reject("OTHER", candidate, strategy, signal_date, "Only short puts are permitted")
+        if qty != 1 or qty > self.cfg.max_contracts_per_trade:
+            return self.reject("MAX_CONTRACTS_REACHED", candidate, strategy, signal_date)
+        if side=='sell':
+            if not self.cfg.enable_entries or self.ledger.blocked():
+                return self.reject("OTHER",candidate,strategy,signal_date,"entries disabled or reconciliation required")
+            allowed, reason = self.entry_capacity(candidate)
+            if not allowed:
+                return self.reject(reason,candidate,strategy,signal_date)
+        else:
+            lot=self.ledger.lots().get(candidate.symbol)
+            if not lot or qty>lot['qty']:
+                return False
+            positions={p.symbol:p for p in self.broker.positions()}
+            if candidate.symbol not in positions or float(positions[candidate.symbol].qty)!=-lot['qty']:
+                return False
+        client_id = f"{STRATEGY_ID}_{candidate.underlying}_{uuid4().hex[:16]}"
         self.ledger.intent(client_id, candidate, strategy, side, qty, signal_date)
         try:
             order = self.broker.submit(candidate, qty, side, limit_price(price), client_id)
@@ -224,44 +318,66 @@ class Trader:
         except Exception as exc:
             # A timeout can occur after acceptance. Never retry with a new ID.
             self.ledger.event("SUBMISSION_UNCERTAIN", candidate.symbol, client_id=client_id, error=str(exc))
+            if side=='sell':
+                self.reject("OTHER",candidate,strategy,signal_date,"submission uncertain: "+str(exc))
             bot_log(f"Submission requires reconciliation: {client_id}: {exc}")
             return False
 
+    def reject(self, reason, candidate, strategy, signal_date, details=""):
+        self.ledger.reject(reason,candidate,self.cfg,variant=strategy,signal_date=signal_date,details=details)
+        bot_log(f"{STRATEGY_ID} ENTRY SKIP {candidate.symbol}: {reason} {details}")
+        return False
+
+    def entry_capacity(self,candidate):
+        ok,reason,_=virtual_capacity(self.cfg,candidate.strike*100,self.ledger.reserved(),self.ledger.realized())
+        if not ok:
+            return False,reason
+        return capacity(self.cfg,self.broker.account(),self.broker.positions(),self.broker.orders(),candidate,
+            own_lots=self.ledger.lots(),own_pending=self.ledger.pending(),realized=self.ledger.realized())
+
     def enter(self, candidate, strategy, signal_date):
+        # This is the preferred contract; failure must never trigger a cheaper fallback.
         if not self.cfg.enable_entries or not self.reconcile():
-            return False
+            return self.reject("OTHER",candidate,strategy,signal_date,"entries disabled or reconciliation incomplete")
         pending = self.ledger.pending()
-        # Await every entry before another; prevents broker snapshot races.
         if any(r["side"] == "sell" or r["status"] == "intent" for r in pending):
-            return False
+            return self.reject("MAX_STRATEGY_EXPOSURE_REACHED",candidate,strategy,signal_date,"pending entry or uncertain order")
         if self.ledger.traded_bar(candidate.underlying, signal_date):
-            return False
+            return self.reject("DUPLICATE_POSITION",candidate,strategy,signal_date,"already submitted on signal bar")
         last_exit = self.ledger.last_exit(candidate.underlying)
         if last_exit and (datetime.now(NY).date() - last_exit).days < self.cfg.cooldown_days:
-            return False
+            return self.reject("OTHER",candidate,strategy,signal_date,"reentry cooldown")
         if not self.broker.earnings_clear(candidate.underlying, candidate.expiry):
-            return False
-        allowed, reason = capacity(self.cfg, self.broker.account(), self.broker.positions(), self.broker.orders(), candidate)
-        if not allowed:
-            self.ledger.event("SKIP", candidate.symbol, reason=reason)
-            return False
+            return self.reject("OTHER",candidate,strategy,signal_date,"earnings unknown or within holding window")
         snap = self.broker.snapshot(candidate.symbol)
         quote = getattr(snap, "latest_quote", None)
         if not valid_quote(quote, self.cfg.quote_max_age):
-            return False
+            return self.reject("OTHER",candidate,strategy,signal_date,"fresh entry quote unavailable")
         bid, ask = float(quote.bid_price), float(quote.ask_price)
-        if (ask - bid) / ((ask + bid) / 2) > self.cfg.max_spread or bid / candidate.strike < self.cfg.min_credit_yield:
-            return False
-        return self.submit(candidate, strategy, "sell", 1, (bid + ask) / 2, signal_date)
+        candidate=replace(candidate,bid=bid,ask=ask)
+        if (ask-bid)/((ask+bid)/2)>self.cfg.max_spread:
+            return self.reject("SPREAD_TOO_WIDE",candidate,strategy,signal_date)
+        if bid/candidate.strike<self.cfg.min_credit_yield:
+            return self.reject("NO_VALID_CONTRACT",candidate,strategy,signal_date,"credit yield below minimum")
+        allowed, reason = self.entry_capacity(candidate)
+        if not allowed:
+            return self.reject(reason,candidate,strategy,signal_date)
+        return self.submit(candidate,strategy,"sell",1,(bid+ask)/2,signal_date)
 
     def manage_exits(self):
         positions = {p.symbol: p for p in self.broker.positions()}
         open_orders = self.broker.orders()
         pending = {r["symbol"] for r in self.ledger.pending()} | {o.symbol for o in open_orders}
         marks = {}
+        for assigned in self.ledger.assigned():
+            root=parse_option(assigned['symbol'])['underlying']
+            if root in positions and float(positions[root].qty)>=assigned['qty']*100:
+                price=float(getattr(positions[root],'current_price',0) or 0)
+                if math.isfinite(price) and price>0:
+                    marks['stock:'+root]=price
         for symbol, lot in self.ledger.lots().items():
             try:
-                if symbol in pending or symbol not in positions or float(positions[symbol].qty) != -lot["qty"]:
+                if symbol not in positions or float(positions[symbol].qty) != -lot["qty"]:
                     continue
                 snap = self.broker.snapshot(symbol)
                 quote = getattr(snap, "latest_quote", None)
@@ -270,6 +386,8 @@ class Trader:
                     continue
                 ask = float(quote.ask_price)
                 marks[symbol] = ask
+                if symbol in pending:
+                    continue
                 expiry = date.fromisoformat(lot["expiry"])
                 dte = (expiry - datetime.now(NY).date()).days
                 bearish = False

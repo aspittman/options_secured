@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 LOG_FILE = "logs/options_bot.log"
+STRATEGY_ID = "cash_secured_put"
 
 
 def flag(name, default=False):
@@ -29,8 +30,10 @@ class Settings:
     min_volume: int = 100
     max_spread: float = 0.10
     min_credit_yield: float = 0.005
+    virtual_starting_capital: float = 25000
+    max_contracts_per_trade: int = 1
     max_collateral_per_trade: float = 25000
-    max_total_collateral: float = 50000
+    max_total_collateral: float = 25000
     cash_buffer: float = 1000
     max_positions: int = 2
     max_per_group: int = 1
@@ -48,13 +51,15 @@ class Settings:
     db_path: str = "logs/options_secured.sqlite3"
 
     def __post_init__(self):
+        if self.max_contracts_per_trade != 1:
+            raise ValueError("Cash-secured put research requires exactly one contract per trade")
         if not self.paper:
             raise ValueError("This implementation supports paper trading only.")
         if not 0 <= self.exit_dte < self.min_dte <= self.max_dte:
             raise ValueError("Require 0 <= EXIT_DTE < MIN_DTE <= MAX_DTE")
         if not -1 < self.target_delta < 0 or not 0 < self.delta_tolerance < 1:
             raise ValueError("Put delta must be negative with a positive tolerance")
-        for name in ("max_collateral_per_trade", "max_total_collateral", "max_positions",
+        for name in ("virtual_starting_capital", "max_collateral_per_trade", "max_total_collateral", "max_positions",
                      "max_per_group", "stop_credit_multiple", "quote_max_age", "scan_seconds",
                      "entry_timeout", "exit_timeout", "max_spread", "max_sma_distance",
                      "max_20d_return", "max_annual_vol"):

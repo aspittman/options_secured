@@ -37,34 +37,43 @@ class RiskTests(unittest.TestCase):
         self.c = candidate()
 
     def test_cash_not_leveraged_buying_power(self):
-        self.assertEqual(capacity(self.cfg, account(5000, 100000), [], [], self.c), (False, "insufficient_cash"))
+        self.assertEqual(capacity(self.cfg, account(5000, 100000), [], [], self.c), (False, "INSUFFICIENT_BROKER_CASH"))
         self.assertTrue(capacity(self.cfg, account(11000), [], [], self.c)[0])
 
     def test_filled_external_put_reserves_full_strike(self):
         external = candidate("BAC", 50)
         position = NS(symbol=external.symbol, qty="-1")
-        self.assertEqual(capacity(self.cfg, account(15000), [position], [], self.c)[1], "insufficient_cash")
+        self.assertEqual(capacity(self.cfg, account(15000), [position], [], self.c)[1], "INSUFFICIENT_BROKER_CASH")
 
     def test_pending_partial_fill_reserves_remaining(self):
         c = candidate("BAC", 50)
         position = NS(symbol=c.symbol, qty="-1")
         order = NS(symbol=c.symbol, qty="2", filled_qty="1", side="sell", client_order_id="os-test")
-        self.assertEqual(capacity(self.cfg, account(20000), [position], [order], self.c)[1], "insufficient_cash")
+        self.assertEqual(capacity(self.cfg, account(20000), [position], [order], self.c)[1], "INSUFFICIENT_BROKER_CASH")
         self.assertTrue(capacity(self.cfg, account(21000), [position], [order], self.c)[0])
 
     def test_correlation_and_stock_exposure(self):
         position = NS(symbol=candidate("SPY").symbol, qty="-1")
-        self.assertEqual(capacity(self.cfg, account(), [position], [], self.c)[1], "correlation_limit")
-        self.assertEqual(capacity(self.cfg, account(), [NS(symbol="IWM", qty="100")], [], self.c)[1], "existing_underlying_exposure")
+        own={position.symbol:dict(underlying='SPY',strike=100,qty=1)}
+        self.assertEqual(capacity(self.cfg,account(),[position],[],self.c,own_lots=own)[1],"MAX_STRATEGY_EXPOSURE_REACHED")
+        # A different strategy's stock position does not consume this bot's slots.
+        self.assertTrue(capacity(self.cfg,account(),[NS(symbol='IWM',qty='100')],[],self.c)[0])
 
     def test_external_open_buy_blocks(self):
         order = NS(symbol="BAC", qty="100", filled_qty="0", side="buy", client_order_id="manual")
-        self.assertEqual(capacity(self.cfg, account(), [], [order], self.c)[1], "external_pending_order")
+        self.assertEqual(capacity(self.cfg, account(), [], [order], self.c)[1], "OTHER")
 
     def test_collateral_caps(self):
-        self.assertEqual(capacity(self.cfg, account(), [], [], candidate(strike=300))[1], "per_trade_collateral")
+        self.assertEqual(capacity(self.cfg, account(), [], [], candidate(strike=900))[1], "COLLATERAL_OVER_LIMIT")
         cfg = replace(self.cfg, max_total_collateral=5000)
-        self.assertEqual(capacity(cfg, account(), [], [], self.c)[1], "portfolio_collateral")
+        self.assertEqual(capacity(cfg, account(), [], [], self.c)[1], "MAX_STRATEGY_EXPOSURE_REACHED")
+
+    def test_virtual_ceiling_supersedes_previous_etf_alignment(self):
+        spy=candidate('SPY',741)
+        self.assertEqual(capacity(self.cfg,account(500000),[],[],spy)[1],'COLLATERAL_OVER_LIMIT')
+        for strike in (50,175,250):
+            self.assertTrue(capacity(self.cfg,account(500000),[],[],candidate(strike=strike))[0])
+        self.assertEqual(capacity(self.cfg,account(500000),[],[],candidate(strike=300))[1],'COLLATERAL_OVER_LIMIT')
 
     def test_quote_sanity_and_age(self):
         self.assertTrue(valid_quote(quote(), 120))
