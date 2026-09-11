@@ -157,10 +157,17 @@ is rejected. No real-money execution is implemented.
 
 ```bash
 python main.py --once
-python main.py
+python launcher.py  # foreground; Ctrl+C stops the bot
+python main.py      # equivalent foreground entry point
 python backtester.py --paper-results
 python -m unittest discover -s tests -v
 ```
+
+Both launchers stay attached to the terminal and print logs there. Ctrl+C stops
+the process and releases its lock; the next launch resumes from the existing
+ledger. No background process or automatic restart is created. Stopping the bot
+does not close broker positions or cancel outstanding orders; reconciliation
+resumes on the next launch.
 
 The indicative option feed may not meet the 120-second freshness requirement;
 unusable quotes are skipped. OPRA requires the appropriate data access. Entries

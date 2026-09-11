@@ -68,27 +68,33 @@ def run_bot(once=False):
             bot_log(
                 "Options Secured is already running and holds this ledger's lock. "
                 "No second instance was started. "
-                "View activity with: tail -f logs/options_bot.log"
+                "Stop the existing instance in its terminal before launching another."
             )
             return
         ledger = Ledger(cfg.db_path)
-        broker = AlpacaBroker(cfg)
-        trader = Trader(cfg, broker, ledger)
-        bot_log(f"Options Secured PAPER started; new entries={cfg.enable_entries}; "
-                f"strategy=cash_secured_put; virtual_capital=${cfg.virtual_starting_capital:,.0f}; "
-                f"collateral_per_trade=${cfg.max_collateral_per_trade:,.0f}; "
-                f"total_collateral=${cfg.max_total_collateral:,.0f}; "
-                f"max_per_group={cfg.max_per_group}; universe={','.join(cfg.underlyings)}")
-        while True:
-            try:
-                cycle(cfg, broker, trader)
-            except Exception as exc:
-                bot_log(f"Cycle unavailable: {exc}")
+        try:
+            broker = AlpacaBroker(cfg)
+            trader = Trader(cfg, broker, ledger)
+            bot_log(f"Options Secured PAPER started in this terminal (Ctrl+C to stop); new entries={cfg.enable_entries}; "
+                    f"strategy=cash_secured_put; virtual_capital=${cfg.virtual_starting_capital:,.0f}; "
+                    f"collateral_per_trade=${cfg.max_collateral_per_trade:,.0f}; "
+                    f"total_collateral=${cfg.max_total_collateral:,.0f}; "
+                    f"max_per_group={cfg.max_per_group}; universe={','.join(cfg.underlyings)}")
+            while True:
+                try:
+                    cycle(cfg, broker, trader)
+                except Exception as exc:
+                    bot_log(f"Cycle unavailable: {exc}")
+                    if once:
+                        raise
                 if once:
-                    raise
-            if once:
-                return
-            time.sleep(cfg.scan_seconds)
+                    return
+                time.sleep(cfg.scan_seconds)
+        except KeyboardInterrupt:
+            bot_log("Options Secured stopped by Ctrl+C. Trade history preserved.")
+        finally:
+            ledger.db.close()
+
 
 
 if __name__ == "__main__":
