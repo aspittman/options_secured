@@ -33,7 +33,8 @@ Contracts: one standard 100-share, out-of-the-money put, 30–45 calendar DTE,
 delta −0.25 ± 0.10, open interest ≥500, current-day volume ≥100, bid/ask spread ≤10%
 of midpoint, and bid premium ≥0.5% of strike. Nonstandard roots/sizes are excluded.
 Corporate earnings must be known to occur after expiration plus one day; unknown
-earnings dates block corporate entries. The default ETF universe avoids earnings.
+earnings dates block corporate entries. Registered ETFs skip corporate earnings calendars; individual stocks retain the
+full holding-window earnings check.
 
 Sell-to-open uses a midpoint day limit. Buy-to-close uses an ask-priced day limit:
 
@@ -47,6 +48,56 @@ Exit signals are reevaluated on subsequent five-minute cycles and repriced if st
 active. These checks cannot guarantee an exit price or prevent early assignment.
 
 These thresholds are starting hypotheses, **not empirically optimized settings**.
+
+## Expanded research universe and premium highlights
+
+The default live/paper universe is 59 symbols (29 ETFs/funds and 30 stocks), configured with `UNDERLYINGS`:
+
+| Category | Symbols |
+| --- | --- |
+| Original broad ETFs | SPY, QQQ, IWM, DIA |
+| Sector/regional/international ETFs | XLF, XLE, XLP, XLU, XLI, XLB, XLV, XLRE, KRE, XBI, EEM, EWZ, EFA |
+| Additional requested funds | ARKK, VNQ, GDX, GLD, SLV, TLT, HYG, LQD, USO, XOP, TAN, IGV |
+| Stocks | BAC, C, WFC, F, GM, T, VZ, PFE, KO, CSCO, INTC, HPQ, KR, WMT, DIS, XOM, AAPL, AMD, MU, SOFI, SNAP, NCLH, UBER, PINS, RIVN, HOOD, ROKU, PYPL, CVX, OXY |
+
+The universe includes every symbol requested from the covered-call bot and retains
+the previous additions. The first expansion was checked against Alpaca on
+September 11, 2026; the subsequent symbols are user-specified additions whose
+current data, contracts and eligibility are checked during each scan.
+This is an expanded search universe, not an assertion that every symbol has an
+eligible setup or adequate option liquidity. Prices and contract availability change.
+ETF identities are listed explicitly in `universe.py`; related funds and stocks
+share correlation limits (for example XLF/KRE/BAC/WFC and XLE/XOM). Existing groups
+and the two-position maximum remain in effect. Metal funds share a precious-metals
+group, bond funds share a fixed-income group, and energy-related additions share
+the existing energy group. These are conservative exposure buckets, not measured
+correlation estimates. The same SPY market filter and underlying strategy rules
+apply to every symbol, including commodity and bond funds. Fund listings:
+[State Street sector ETFs](https://www.ssga.com/us/en/individual/capabilities/equities/sector-investing/select-sector-etfs),
+[State Street fund lineup](https://www.ssga.com/library-content/pdfs/etf/us/spdr-product-line-up/lpl.pdf),
+[iShares funds](https://www.ishares.com/us/products/etf-investments).
+
+Signals, DTE, delta, liquidity, spread, earnings, collateral, cash and ownership
+rules are unchanged. `MAX_POSITIONS=2` limits simultaneous positions, not lifetime
+trades. The broader universe expands scanned/rejected opportunities but does not
+guarantee more fills, especially while existing positions reserve the allocation. Preferred contracts are still selected before checking
+capital, with no cheaper-strike fallback. A `$500` premium is **not** a trade limit
+or a ranking preference. For a short put it is income received, not the cash
+required to enter the position; assignment collateral remains strike × 100.
+Lower premium or notional does not establish profitability in real trading.
+
+Each confirmed opening fill or buyback logs its actual total option premium:
+`fill price × filled contracts × 100`. Totals from $0.01 through $500.00 are marked
+`[PREMIUM <= $500]` and displayed in bold cyan on an interactive terminal.
+`SELL_TO_OPEN` shows `credit_received`; `BUY_TO_CLOSE` shows `debit_paid`, not profit.
+The line also shows strike collateral, so a small premium is not confused with a
+small cash obligation. Pending, rejected, and simulated trades are never labeled
+as confirmed fills. Repeated reconciliation does not repeat the highlight.
+File logs retain the searchable marker without ANSI color codes. Redirected output
+also retains the marker; set `NO_COLOR` to suppress terminal color if desired.
+
+After updating a running foreground bot, press Ctrl+C and run `python3 launcher.py`
+again to load the new universe. No background process is created by this change.
 
 ## Cash-secured-put-only execution guard
 
@@ -97,7 +148,8 @@ fallback. The $1,000 buffer applies to account cash, not as an extra reduction o
 the virtual $25,000 allocation. Both checks must pass.
 
 Only ledger-owned puts count toward the two-position and one-per-correlation-group
-limits. All four default ETFs share a group, so at most one can be open here.
+limits. The four original broad ETFs share a group; added ETFs share appropriate sector
+or regional groups with related holdings.
 Unrelated stocks, long puts, and calls are never adopted, closed, or cancelled.
 Same-contract exposure is rejected because Alpaca nets positions. Unknown pending
 market-buy debits block new entries conservatively; known limit buys reserve their
@@ -219,7 +271,11 @@ python backtester.py --years 1 --data-dir historical_data
 Offline data requires `SYMBOL.csv` with `Date,Close` columns for each configured
 underlying and SPY, including at least 205 trading days of warmup. Online mode
 downloads daily underlying history from Yahoo Finance. Synthetic backtesting is
-restricted to the four default ETFs because it has no earnings model.
+restricted to the 29 explicitly registered ETFs/funds because it has no historical
+earnings model. The CLI prints and records the excluded stock symbols in each
+summary before running the ETF subset; the live universe is not changed. Offline
+data therefore needs SPY and the configured registered ETFs. A stock-only universe
+is rejected for historical simulation rather than bypassing earnings controls.
 
 The simulator shares entry/exit rules and portfolio limits, uses prior-day signals
 and volatility, hypothetical next-close fills, Black–Scholes European put prices,

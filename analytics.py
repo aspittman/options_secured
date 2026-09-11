@@ -8,6 +8,7 @@ from pathlib import Path
 from config import STRATEGY_ID
 from performance import statistics
 from risk import parse_option, virtual_capacity
+from bot_logger import log_option_fill
 
 TERMINAL = {"filled", "canceled", "expired", "rejected"}
 REJECTION_FIELDS = ["timestamp", "strategy", "variant", "underlying", "contract_symbol",
@@ -155,6 +156,10 @@ class Ledger:
                     self.db.execute("UPDATE lots SET qty=qty-? WHERE symbol=?", (delta, row["symbol"]))
             self.db.execute("UPDATE orders SET broker_id=?, status=?, filled=?, notional=? WHERE client_id=?",
                             (broker_id, status, filled, notional, client_id))
+        # Emit once for newly reconciled fills, after the transaction commits.
+        # Polling the same fill again must not produce another trade highlight.
+        if delta > 0:
+            log_option_fill(row['symbol'], row['side'], delta, price, row['strike'], client_id)
 
     def realized(self):
         return float(self.db.execute('SELECT COALESCE(SUM(realized),0) FROM pnl').fetchone()[0])

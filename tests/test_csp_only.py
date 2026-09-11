@@ -46,6 +46,13 @@ class CSPOnlyTests(unittest.TestCase):
         self.assertEqual(req.position_intent.value,'sell_to_open')
         self.assertEqual(self.ledger.reserved(),17500)
 
+    def test_premium_over_500_remains_allowed(self):
+        self.intent()
+        self.broker.submit(self.c,1,'sell',6.25,self.id)
+        request=self.broker.trading.submit_order.call_args.kwargs['order_data']
+        self.assertEqual(request.limit_price,6.25)
+        self.assertEqual(request.position_intent.value,'sell_to_open')
+
     def test_no_direct_adapter_bypass_without_owned_intent(self):
         self.blocked()
 

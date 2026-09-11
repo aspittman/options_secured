@@ -21,6 +21,7 @@ from bot_logger import bot_log
 from config import credentials, STRATEGY_ID
 from risk import capacity, parse_option, virtual_capacity
 from strategy import bearish_at, exit_reason, indicators
+from universe import ETF_SYMBOLS
 
 NY = ZoneInfo("America/New_York")
 
@@ -210,7 +211,7 @@ class AlpacaBroker:
         return frame
 
     def earnings_clear(self, underlying, expiry):
-        if underlying in {"SPY", "QQQ", "IWM", "DIA"}:
+        if underlying in ETF_SYMBOLS:
             return True
         # Unknown calendars fail closed; cover the whole potential holding period.
         import yfinance as yf

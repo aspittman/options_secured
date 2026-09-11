@@ -14,6 +14,7 @@ import pandas as pd
 from analytics import Ledger, REJECTION_FIELDS
 from performance import statistics
 from risk import virtual_capacity
+from universe import ETF_SYMBOLS, backtest_universe
 from config import Settings, correlation_group
 from strategy import STRATEGIES, bearish_at, entry_at, exit_reason, indicators, regime_at
 
@@ -43,7 +44,7 @@ def simulate(histories, cfg, start, starting_cash=None, slippage=0.05, fee=0.65)
 
     Return full daily marked equity, including open liabilities. Stocks/ETFs use
     raw closes; actual option chains, liquidity, earnings, and early assignment
-    are not modeled. Only default broad ETFs are supported here.
+    are not modeled. Only the explicitly registered ETFs are supported here.
     """
     if starting_cash is None:
         starting_cash=cfg.virtual_starting_capital
@@ -53,8 +54,8 @@ def simulate(histories, cfg, start, starting_cash=None, slippage=0.05, fee=0.65)
         raise ValueError("Invalid simulation costs or starting cash")
     if "SPY" not in histories:
         raise ValueError("SPY market-regime history is required")
-    if any(s not in {"SPY", "QQQ", "IWM", "DIA"} for s in cfg.underlyings):
-        raise ValueError("Synthetic backtest supports broad ETFs only; no earnings model")
+    if any(s not in ETF_SYMBOLS for s in cfg.underlyings):
+        raise ValueError("Synthetic backtest supports registered ETFs only; no historical earnings model")
     frames = {s: indicators(close) for s, close in histories.items()}
     dates = sorted(set().union(*(set(f.index) for f in frames.values())))
     cash, lots, trades, curve, last_exit = float(starting_cash), {}, [], [], {}
@@ -186,6 +187,12 @@ def main():
     if args.paper_results:
         print(json.dumps(Ledger(cfg.db_path).report(starting_capital=cfg.virtual_starting_capital), indent=2))
         return
+    included, excluded = backtest_universe(cfg.underlyings)
+    if not included:
+        parser.error('No supported ETFs in UNDERLYINGS; corporate backtests require historical earnings data')
+    if excluded:
+        print('Historical run excludes stocks without an earnings model: ' + ','.join(excluded))
+    cfg = replace(cfg, underlyings=included)
     if args.years <= 0:
         parser.error("--years must be positive")
     if args.starting_cash is not None and (not math.isfinite(args.starting_cash) or args.starting_cash<=0):
@@ -212,6 +219,8 @@ def main():
         # Explicit historical scenario: both virtual and collateral ceilings change together.
         run_cfg=replace(cfg,virtual_starting_capital=capital,max_collateral_per_trade=capital,max_total_collateral=capital) if args.compare_capital or args.starting_cash else cfg
         trades,curve,summary=simulate(histories,run_cfg,start,None,args.slippage,args.fee)
+        summary['underlyings_tested'] = list(included)
+        summary['excluded_without_historical_earnings'] = list(excluded)
         suffix=f"_{capital:g}" if args.compare_capital else ""
         save_csv(f"logs/options_backtest_trades{suffix}.csv",trades,["symbol","strategy","entry_date","exit_date","strike","entry_credit","exit_debit","collateral","pnl","return_on_collateral","reason","hold_days","outcome"])
         save_csv(f"logs/options_backtest_equity_curve{suffix}.csv",curve,["date","cash","short_liability","reserved_collateral","equity"])

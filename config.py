@@ -3,6 +3,7 @@ import os
 from dataclasses import dataclass
 from math import isfinite
 from dotenv import load_dotenv
+from universe import DEFAULT_UNDERLYINGS, correlation_group
 
 load_dotenv()
 LOG_FILE = "logs/options_bot.log"
@@ -20,7 +21,7 @@ def flag(name, default=False):
 class Settings:
     paper: bool = True
     enable_entries: bool = False
-    underlyings: tuple = ("SPY", "QQQ", "IWM", "DIA")
+    underlyings: tuple = DEFAULT_UNDERLYINGS
     min_dte: int = 30
     max_dte: int = 45
     exit_dte: int = 7
@@ -98,15 +99,3 @@ def credentials():
     if not key or not secret:
         raise RuntimeError("Set APCA_API_KEY_ID and APCA_API_SECRET_KEY in .env")
     return key, secret
-
-
-def correlation_group(symbol):
-    groups = {
-        "index": {"SPY", "QQQ", "IWM", "DIA"},
-        "technology": {"AAPL", "MSFT", "NVDA", "AMD", "AMZN", "META", "GOOG", "GOOGL", "TSLA", "NFLX", "AVGO", "CRM", "ORCL", "ADBE", "INTC", "QCOM", "MU"},
-        "financial": {"JPM", "BAC", "GS", "MS", "C"},
-        "energy": {"XOM", "CVX", "COP", "SLB"},
-        "health": {"UNH", "LLY", "JNJ", "PFE", "MRK"},
-        "consumer": {"COST", "WMT", "HD", "DIS", "BA"},
-    }
-    return next((group for group, symbols in groups.items() if symbol in symbols), symbol)
