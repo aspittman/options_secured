@@ -48,6 +48,21 @@ active. These checks cannot guarantee an exit price or prevent early assignment.
 
 These thresholds are starting hypotheses, **not empirically optimized settings**.
 
+## Cash-secured-put-only execution guard
+
+Immediately before sending an order, the Alpaca adapter requires a fresh matching
+intent in this bot's ledger, the `cash_secured_put` client ID, and verified broker
+metadata for a standard 100-share put whose underlying, strike and expiry match.
+Calls, stocks, adjusted contracts, and mismatched contract descriptions are blocked.
+
+A sale is always `sell_to_open`, with both virtual collateral and account cash
+rechecked at submission. A purchase is always `buy_to_close`, requiring this bot's
+ledger-owned short put, the matching broker short quantity, and no competing order
+for that contract. New long puts and unowned buybacks are blocked. Existing owned
+put exits remain available when entry limits are exceeded or entries are disabled.
+Assigned shares may still be delivered by Alpaca; this bot tracks them but does
+not submit stock trades or start a covered-call strategy.
+
 ## Cash and reconciliation
 
 The research allocation is **$25,000 for the whole CashSecuredPutBot**, shared by
@@ -89,7 +104,11 @@ market-buy debits block new entries conservatively; known limit buys reserve the
 maximum debit. Shared-account snapshots cannot eliminate races with other bots.
 
 New IDs use `cash_secured_put_<underlying>_<unique suffix>`. Existing ledger-recorded
-`os-` IDs remain owned and manageable. Prefix alone never grants ownership.
+`os-` IDs remain owned and manageable. Prefix alone never grants ownership. New submissions must carry the strategy
+prefix, and cancellation re-fetches the broker order and verifies strategy ID,
+ledger ownership, contract, side, and broker ID immediately before cancelling.
+There is no order-modification endpoint in this bot; repricing uses guarded
+cancellation followed by a newly tagged order.
 
 SQLite in `logs/options_secured.sqlite3` records intent **before** network submission,
 cumulative partial fills, realized credit-minus-debit P/L, and order status.

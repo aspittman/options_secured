@@ -25,6 +25,26 @@ from strategy import bearish_at, exit_reason, indicators
 NY = ZoneInfo("America/New_York")
 
 
+def verify_owned_order(row, order):
+    """Require both our durable ledger record and matching broker identity.
+
+    Pre-identifier os- orders are permitted only when already in our ledger.
+    A strategy-looking prefix on an untracked broker order is never sufficient.
+    """
+    if row is None:
+        raise ValueError("Order is not recorded in this bot's ledger")
+    client_id = row['client_id']
+    permitted = client_id.startswith(f'{STRATEGY_ID}_{row["underlying"]}_') or client_id.startswith('os-')
+    parsed = parse_option(row['symbol'])
+    if (not permitted or not parsed or parsed['kind'] != 'P'
+        or parsed['underlying'] != row['underlying']
+        or getattr(order,'symbol',None) != row['symbol']
+        or getattr(order,'client_order_id',None) != client_id
+        or str(getattr(order.side,'value',order.side)) != row['side']
+        or (row['broker_id'] and str(order.id) != row['broker_id'])):
+        raise ValueError("Broker order strategy/ownership mismatch; operation blocked")
+
+
 @dataclass(frozen=True)
 class Candidate:
     symbol: str
@@ -81,6 +101,13 @@ class AlpacaBroker:
         return self.trading.get_order_by_client_id(client_id)
 
     def cancel(self, broker_id):
+        ledger = getattr(self, 'ledger', None)
+        row = ledger.db.execute('SELECT * FROM orders WHERE broker_id=?', (str(broker_id),)).fetchone() if ledger else None
+        if row is None:
+            raise ValueError("Cannot cancel an order outside this bot's ledger")
+        # Re-read immediately before mutation, rather than trusting a caller's ID.
+        order = self.trading.get_order_by_id(broker_id)
+        verify_owned_order(row, order)
         self.trading.cancel_order_by_id(broker_id)
 
     def settlement_activities(self, after):
@@ -98,13 +125,67 @@ class AlpacaBroker:
             params['page_token']=page[-1]['id']
 
     def submit(self, candidate, qty, side, price, client_id):
+        if not client_id.startswith(f'{STRATEGY_ID}_{candidate.underlying}_'):
+            raise ValueError('Every new order must carry this bot\'s strategy identifier')
         parsed=parse_option(candidate.symbol)
-        if qty!=1 or not parsed or parsed['kind']!='P' or side not in {'sell','buy'}:
+        if (qty!=1 or isinstance(qty,bool) or not parsed or parsed['kind']!='P'
+            or side not in {'sell','buy'} or parsed['underlying']!=candidate.underlying
+            or parsed['strike']!=candidate.strike or parsed['expiry']!=candidate.expiry
+            or not math.isfinite(price) or price<=0):
             raise ValueError('Alpaca adapter accepts only one short-put contract or its buyback')
+        self.validate_submission(candidate, qty, side, client_id)
         return self.trading.submit_order(order_data=LimitOrderRequest(
             symbol=candidate.symbol, qty=qty, side=OrderSide(side),
             position_intent=PositionIntent.SELL_TO_OPEN if side == "sell" else PositionIntent.BUY_TO_CLOSE,
             time_in_force=TimeInForce.DAY, limit_price=price, client_order_id=client_id))
+
+    def validate_submission(self, candidate, qty, side, client_id):
+        """Final fail-closed check immediately before any order reaches Alpaca.
+
+        This repeats the execution layer's safeguards so calling the adapter
+        directly cannot open a long put, an unsecured put, or an unowned close.
+        """
+        ledger=getattr(self,'ledger',None)
+        cfg=getattr(self,'cfg',None)
+        if ledger is None or cfg is None or not cfg.paper:
+            raise ValueError('Paper configuration and owned ledger are required')
+        row=ledger.db.execute('SELECT * FROM orders WHERE client_id=?',(client_id,)).fetchone()
+        if (row is None or row['status']!='intent' or row['broker_id'] is not None
+            or row['symbol']!=candidate.symbol or row['underlying']!=candidate.underlying
+            or row['side']!=side or row['qty']!=qty or row['strike']!=candidate.strike
+            or row['expiry']!=candidate.expiry.isoformat()):
+            raise ValueError('Submission must match a fresh owned order intent')
+        contract=self.trading.get_option_contract(candidate.symbol)
+        if (str(getattr(contract.type,'value',contract.type))!='put'
+            or contract.symbol!=candidate.symbol or contract.root_symbol!=candidate.underlying
+            or float(contract.size or 0)!=100 or float(contract.strike_price)!=candidate.strike
+            or contract.expiration_date!=candidate.expiry):
+            raise ValueError('Only verified standard 100-share put contracts are permitted')
+        positions=self.positions()
+        orders=self.orders()
+        if side=='sell':
+            if not cfg.enable_entries or ledger.blocked():
+                raise ValueError('New cash-secured put entries are disabled or blocked')
+            # Current intent already reserves cash in SQLite. Exclude it once
+            # when checking whether this proposed order fits; retain all others.
+            reserved=ledger.reserved()-candidate.strike*qty*100
+            allowed,reason,_=virtual_capacity(cfg,candidate.strike*qty*100,reserved,ledger.realized())
+            if not allowed:
+                raise ValueError(reason)
+            pending=[o for o in ledger.pending() if o['client_id']!=client_id]
+            allowed,reason=capacity(cfg,self.account(),positions,orders,candidate,
+                own_lots=ledger.lots(),own_pending=pending,realized=ledger.realized())
+            if not allowed:
+                raise ValueError(reason)
+        else:
+            lot=ledger.lots().get(candidate.symbol)
+            position=next((p for p in positions if p.symbol==candidate.symbol),None)
+            if (not lot or lot['qty']<qty or position is None
+                or float(position.qty)!=-lot['qty']):
+                raise ValueError('Buyback requires this strategy\'s confirmed short-put position')
+            if (any(o.symbol==candidate.symbol for o in orders)
+                or any(o['symbol']==candidate.symbol and o['client_id']!=client_id for o in ledger.pending())):
+                raise ValueError('Another order already exists for this put; duplicate buyback blocked')
 
     def snapshot(self, symbol):
         return self.options.get_option_snapshot(OptionSnapshotRequest(symbol_or_symbols=[symbol], feed=self.feed)).get(symbol)
@@ -231,17 +312,14 @@ class AlpacaBroker:
 class Trader:
     def __init__(self, cfg, broker, ledger):
         self.cfg, self.broker, self.ledger = cfg, broker, ledger
+        self.broker.ledger = ledger
 
     def reconcile(self):
         healthy = True
         for row in self.ledger.pending():
             try:
                 order = self.broker.lookup(row["client_id"])
-                parsed = parse_option(row['symbol'])
-                if (not parsed or parsed['kind']!='P' or getattr(order,'symbol',None)!=row['symbol']
-                    or getattr(order,'client_order_id',None)!=row['client_id']
-                    or str(getattr(order.side,'value',order.side))!=row['side']):
-                    raise ValueError("Broker order ownership/type mismatch")
+                verify_owned_order(row, order)
                 status = str(getattr(order.status, "value", order.status))
                 self.ledger.reconcile(row["client_id"], str(order.id), status,
                                       float(order.filled_qty or 0), float(order.filled_avg_price or 0))

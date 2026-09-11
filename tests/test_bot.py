@@ -287,8 +287,11 @@ class AdapterTests(unittest.TestCase):
         captured = []
         broker.trading = NS(submit_order=lambda **kwargs: captured.append(kwargs["order_data"]))
         c = candidate()
-        broker.submit(c, 1, "sell", 1.05, "os-entry")
-        broker.submit(c, 1, "buy", .50, "os-exit")
+        # Request serialization is isolated here; final-boundary checks have
+        # separate integration coverage in test_csp_only.py.
+        with patch.object(broker,'validate_submission'):
+            broker.submit(c, 1, "sell", 1.05, "cash_secured_put_IWM_entry")
+            broker.submit(c, 1, "buy", .50, "cash_secured_put_IWM_exit")
         self.assertEqual(captured[0].position_intent.value, "sell_to_open")
         self.assertEqual(captured[1].position_intent.value, "buy_to_close")
         self.assertEqual(captured[0].time_in_force.value, "day")
