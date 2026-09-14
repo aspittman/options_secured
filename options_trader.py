@@ -21,6 +21,7 @@ from bot_logger import bot_log
 from config import credentials, STRATEGY_ID
 from risk import capacity, parse_option, virtual_capacity
 from strategy import bearish_at, exit_reason, indicators
+from oasis import entry_window, session_exit, short_option_exit
 from universe import ETF_SYMBOLS
 
 NY = ZoneInfo("America/New_York")
@@ -366,6 +367,26 @@ class Trader:
                 bot_log(f"RECONCILIATION REQUIRED: {symbol}, ledger={-lot['qty']}, broker={actual}")
         return healthy and not self.ledger.blocked()
 
+    def cancel_blocked_entries(self, clock):
+        healthy = True
+        for row in self.ledger.pending():
+            if row['side'] != 'sell':
+                continue
+            if not (self.ledger.loss_blocked(row['underlying']) or row['strategy'] == 'oasis' and not entry_window(clock)):
+                continue
+            try:
+                order = self.broker.lookup(row['client_id'])
+                verify_owned_order(row, order)
+                status = str(getattr(order.status, 'value', order.status))
+                self.ledger.reconcile(row['client_id'], str(order.id), status,
+                                      float(order.filled_qty or 0), float(order.filled_avg_price or 0))
+                if status not in TERMINAL:
+                    self.broker.cancel(str(order.id))
+            except Exception as exc:
+                healthy = False
+                bot_log(f'Blocked entry cancellation unavailable: {exc}')
+        return healthy
+
     def submit(self, candidate, strategy, side, qty, price, signal_date=""):
         parsed = parse_option(candidate.symbol)
         if not parsed or parsed['kind']!='P' or parsed['underlying']!=candidate.underlying or parsed['strike']!=candidate.strike or side not in {'sell','buy'}:
@@ -373,6 +394,12 @@ class Trader:
         if qty != 1 or qty > self.cfg.max_contracts_per_trade:
             return self.reject("MAX_CONTRACTS_REACHED", candidate, strategy, signal_date)
         if side=='sell':
+            if self.ledger.loss_blocked(candidate.underlying):
+                return self.reject("SHARED_LOSS_REENTRY_BLOCK", candidate, strategy, signal_date)
+            if any(r['underlying'] == candidate.underlying and r['side'] == 'buy' for r in self.ledger.pending()):
+                return self.reject("OTHER", candidate, strategy, signal_date, "underlying exit pending")
+            if strategy == 'oasis' and not entry_window(self.broker.trading.get_clock()):
+                return self.reject("OTHER", candidate, strategy, signal_date, "oasis entry cutoff")
             if not self.cfg.enable_entries or self.ledger.blocked():
                 return self.reject("OTHER",candidate,strategy,signal_date,"entries disabled or reconciliation required")
             allowed, reason = self.entry_capacity(candidate)
@@ -423,8 +450,10 @@ class Trader:
             return self.reject("MAX_STRATEGY_EXPOSURE_REACHED",candidate,strategy,signal_date,"pending entry or uncertain order")
         if self.ledger.traded_bar(candidate.underlying, signal_date):
             return self.reject("DUPLICATE_POSITION",candidate,strategy,signal_date,"already submitted on signal bar")
+        if self.ledger.loss_blocked(candidate.underlying):
+            return self.reject("SHARED_LOSS_REENTRY_BLOCK", candidate, strategy, signal_date)
         last_exit = self.ledger.last_exit(candidate.underlying)
-        if last_exit and (datetime.now(NY).date() - last_exit).days < self.cfg.cooldown_days:
+        if strategy != 'oasis' and last_exit and (datetime.now(NY).date() - last_exit).days < self.cfg.cooldown_days:
             return self.reject("OTHER",candidate,strategy,signal_date,"reentry cooldown")
         if not self.broker.earnings_clear(candidate.underlying, candidate.expiry):
             return self.reject("OTHER",candidate,strategy,signal_date,"earnings unknown or within holding window")
@@ -474,7 +503,16 @@ class Trader:
                     bearish = bearish_at(self.broker.history(lot["underlying"]), -1)
                 except Exception as exc:
                     bot_log(f"Technical exit unavailable for {symbol}: {exc}")
-                reason = exit_reason(lot["credit"], ask, dte, bearish, self.cfg)
+                if lot['strategy'] == 'oasis':
+                    reason = session_exit(self.broker.trading.get_clock(), self.ledger.latest_entry_timestamp(symbol)) or short_option_exit(
+                        lot['credit'], ask, dte, self.cfg.exit_dte, lot['underlying'])
+                else:
+                    reason = exit_reason(lot["credit"], ask, dte, bearish, self.cfg)
+                if lot['strategy'] == 'oasis' and not reason and self.cfg.option_trailing_stop_percent > 0:
+                    stop = self.ledger.option_trailing_stop(
+                        symbol, lot['credit'], ask, self.cfg.option_trailing_stop_percent)
+                    if ask >= stop:
+                        reason = 'option_trailing_stop'
                 if reason:
                     candidate = Candidate(symbol, lot["underlying"], lot["strike"], expiry, float(quote.bid_price), ask)
                     self.ledger.event("EXIT_SIGNAL", symbol, reason=reason)

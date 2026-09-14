@@ -9,7 +9,8 @@ from analytics import Ledger
 from bot_logger import bot_log, setup_logging
 from config import Settings
 from options_trader import AlpacaBroker, Trader
-from strategy import STRATEGIES, entry_at, regime_at
+from strategy import entry_at, regime_at
+from oasis import refresh_oasis_data, get_oasis_signal_state, entry_window
 
 
 def cycle(cfg, broker, trader):
@@ -18,13 +19,16 @@ def cycle(cfg, broker, trader):
     if not clock.is_open:
         bot_log("Market closed; orders reconciled.")
         return
+    cancellations_ok = trader.cancel_blocked_entries(clock)
+    if hasattr(broker, 'stocks') and hasattr(broker, 'trading'):
+        refresh_oasis_data(cfg.underlyings, broker.stocks, broker.trading, clock.timestamp)
     marks = trader.manage_exits()
     trader.ledger.record_equity(marks,cfg)
     report=trader.ledger.report(marks,cfg.virtual_starting_capital)
     bot_log(json.dumps(report))
     Path(cfg.db_path).with_name('performance_summary.json').write_text(json.dumps(report,indent=2))
     trader.ledger.export()
-    if not cfg.enable_entries or not healthy:
+    if not cfg.enable_entries or not healthy or not cancellations_ok:
         return
     market = broker.history("SPY")
     if not regime_at(market, -1, cfg):
@@ -37,18 +41,22 @@ def cycle(cfg, broker, trader):
             if frame.index[-1].date() != market.index[-1].date():
                 continue
             signal_date = frame.index[-1].date().isoformat()
-            eligible = [s for s in STRATEGIES if entry_at(frame, -1, s, cfg)]
+            if entry_at(frame, -1, 'regular', cfg) and not trader.ledger.traded_bar(underlying, signal_date):
+                eligible.append(('regular', signal_date))
+            state = get_oasis_signal_state(underlying)
+            if entry_window(broker.trading.get_clock()) and state['new_signal']:
+                eligible.append(('oasis', state['signal_date']))
             if not eligible:
-                bot_log(f"ENTRY SKIP {underlying}: no eligible daily strategy on {signal_date}")
                 continue
+            variant, signal_date = eligible[0]
             broker.rejection_sink=lambda reason,candidate=None,**details: trader.ledger.reject(
-                reason,candidate,cfg,underlying=underlying,variant=eligible[0],signal_date=signal_date,**details)
+                reason,candidate,cfg,underlying=underlying,variant=variant,signal_date=signal_date,**details)
             candidates=broker.candidates(underlying)
             if candidates:
-                trader.enter(candidates[0],eligible[0],signal_date)
+                trader.enter(candidates[0],variant,signal_date)
             else:
                 trader.ledger.reject('NO_VALID_CONTRACT',cfg=cfg,underlying=underlying,
-                                    variant=eligible[0],signal_date=signal_date)
+                                    variant=variant,signal_date=signal_date)
         except Exception as exc:
             bot_log(f"Entry scan unavailable for {underlying}: {exc}")
             if eligible:
@@ -89,7 +97,7 @@ def run_bot(once=False):
                         raise
                 if once:
                     return
-                time.sleep(cfg.scan_seconds)
+                time.sleep(min(cfg.scan_seconds, 60))
         except KeyboardInterrupt:
             bot_log("Options Secured stopped by Ctrl+C. Trade history preserved.")
         finally:

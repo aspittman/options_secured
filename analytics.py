@@ -29,6 +29,9 @@ class Ledger:
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
             PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS option_trailing_marks (
+                symbol TEXT PRIMARY KEY, entry_id TEXT NOT NULL, low_price REAL NOT NULL);
+
             CREATE TABLE IF NOT EXISTS orders (
                 client_id TEXT PRIMARY KEY, broker_id TEXT, symbol TEXT,
                 underlying TEXT, strategy TEXT, side TEXT, qty INTEGER,
@@ -119,6 +122,41 @@ class Ledger:
     def traded_bar(self, underlying, signal_date):
         return bool(self.db.execute("SELECT 1 FROM orders WHERE underlying=? AND signal_date=? AND side='sell'",
                                     (underlying, signal_date)).fetchone())
+
+    def option_trailing_stop(self, symbol, entry_credit, ask, fraction):
+        """Persist the lowest observed buyback price for this entry, not prior trades."""
+        from math import isfinite
+        if not all(isfinite(v) and v > 0 for v in (entry_credit, ask)) or not 0 < fraction < 1:
+            raise ValueError('Invalid short-option trailing-stop input')
+        entry = self.db.execute("SELECT client_id FROM fills WHERE symbol=? AND side='sell' ORDER BY timestamp DESC,rowid DESC LIMIT 1", (symbol,)).fetchone()
+        # A legacy position without an entry ID still gets a conservative entry-based stop.
+        if not entry:
+            return min(entry_credit, ask) * (1 + fraction)
+        entry_id = entry[0]
+        row = self.db.execute('SELECT entry_id,low_price FROM option_trailing_marks WHERE symbol=?', (symbol,)).fetchone()
+        low = min(entry_credit, ask)
+        if row and row['entry_id'] == entry_id:
+            low = min(low, row['low_price'])
+        if not row or row['entry_id'] != entry_id or low < row['low_price']:
+            with self.db:
+                self.db.execute('INSERT OR REPLACE INTO option_trailing_marks VALUES (?,?,?)', (symbol, entry_id, low))
+        return low * (1 + fraction)
+
+    def loss_blocked(self, underlying, today=None):
+        from loss_guard import blocked
+        from zoneinfo import ZoneInfo
+        losses = {}
+        for row in self.db.execute('SELECT * FROM pnl WHERE realized < 0'):
+            root = parse_option(row['symbol'])['underlying']
+            stamp = datetime.fromisoformat(row['timestamp'])
+            day = stamp.astimezone(ZoneInfo('America/New_York')).date() if stamp.tzinfo else stamp.date()
+            losses[root] = max(losses.get(root, day), day)
+        from portfolio_loss_guard import portfolio_blocked
+        return blocked(underlying, losses, today) or portfolio_blocked(underlying, today)
+
+    def latest_entry_timestamp(self, symbol):
+        row = self.db.execute("SELECT MAX(timestamp) FROM fills WHERE symbol=? AND side='sell'", (symbol,)).fetchone()
+        return row[0] or ''
 
     def last_exit(self, underlying):
         row = self.db.execute("SELECT MAX(created) FROM orders WHERE underlying=? AND side='buy' AND filled>0", (underlying,)).fetchone()

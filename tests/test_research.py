@@ -136,7 +136,8 @@ class ResearchLedgerTests(unittest.TestCase):
 class SelectionTests(unittest.TestCase):
     def test_no_cheaper_fallback_after_preferred_rejection(self):
         frame=pd.DataFrame({'close':[300]},index=pd.DatetimeIndex(['2026-09-09']))
-        broker=NS(trading=NS(get_clock=lambda:NS(is_open=True)),history=lambda s:frame,
+        broker=NS(trading=NS(get_clock=lambda:NS(is_open=True, timestamp=datetime.now(timezone.utc),
+                      next_close=datetime.now(timezone.utc)+timedelta(hours=2))),history=lambda s:frame,
                   candidates=lambda s:[contract(300),contract(175)])
         from unittest.mock import Mock
         trader=Mock()
@@ -144,6 +145,7 @@ class SelectionTests(unittest.TestCase):
         trader.manage_exits.return_value={}
         trader.ledger.report.return_value={}
         trader.enter.return_value=False
+        trader.ledger.traded_bar.return_value=False
         with patch('main.regime_at',return_value=True),patch('main.entry_at',return_value=True),patch('main.bot_log'):
             cycle(replace(Settings(),underlyings=('IWM',),enable_entries=True),broker,trader)
         trader.enter.assert_called_once()

@@ -3,7 +3,8 @@ import math
 import pandas as pd
 from ta.momentum import RSIIndicator
 
-STRATEGIES = ("sideways", "bullish_pullback")
+STRATEGIES = ("sideways", "bullish_pullback")  # historical daily research
+LIVE_STRATEGIES = ("regular", "oasis")
 
 
 def indicators(close):
@@ -33,6 +34,8 @@ def regime_at(frame, index, cfg):
 
 
 def entry_at(frame, index, variant, cfg):
+    if variant == "regular":
+        variant = "sideways"
     if variant not in STRATEGIES:
         raise ValueError(f"Unknown strategy {variant}")
     if not regime_at(frame, index, cfg):

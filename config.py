@@ -40,6 +40,7 @@ class Settings:
     max_per_group: int = 1
     profit_capture: float = 0.50
     stop_credit_multiple: float = 2.0
+    option_trailing_stop_percent: float = .20  # Oasis only; regular retains its credit stop.
     max_sma_distance: float = 0.05
     max_20d_return: float = 0.08
     max_annual_vol: float = 0.35
@@ -47,11 +48,13 @@ class Settings:
     entry_timeout: int = 900
     exit_timeout: int = 120
     quote_max_age: int = 120
-    scan_seconds: int = 300
+    scan_seconds: int = 60
     option_feed: str = "indicative"
     db_path: str = "logs/options_secured.sqlite3"
 
     def __post_init__(self):
+        if not 0 <= self.option_trailing_stop_percent < 1:
+            raise ValueError('OPTION_TRAILING_STOP_PERCENT must be at least zero and less than one')
         if self.max_contracts_per_trade != 1:
             raise ValueError("Cash-secured put research requires exactly one contract per trade")
         if not self.paper:
