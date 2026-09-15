@@ -1,3 +1,4 @@
+from zoneinfo import ZoneInfo
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,8 +20,8 @@ class SecuredOasisExecutionTests(unittest.TestCase):
                 cid=f'cash_secured_put_IWM_{i}';ledger.intent(cid,c,'oasis',side,1)
                 ledger.reconcile(cid,cid,'filled',1,price)
             ledger.db.close();ledger=Ledger(path)
-            self.assertTrue(ledger.loss_blocked('IWM',now.date()+timedelta(days=30)))
-            self.assertFalse(ledger.loss_blocked('IWM',now.date()+timedelta(days=31)))
+            self.assertTrue(ledger.loss_blocked('IWM',now.astimezone(ZoneInfo("America/New_York")).date()+timedelta(days=30)))
+            self.assertFalse(ledger.loss_blocked('IWM',now.astimezone(ZoneInfo("America/New_York")).date()+timedelta(days=31)))
             broker=MagicMock();trader=Trader(Settings(enable_entries=True),broker,ledger)
             for variant in ('regular','oasis'):
                 self.assertFalse(trader.submit(c,variant,'sell',1,1))

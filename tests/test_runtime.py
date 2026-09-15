@@ -1,4 +1,4 @@
-import fcntl
+import process_lock as fcntl
 import tempfile
 import unittest
 from pathlib import Path

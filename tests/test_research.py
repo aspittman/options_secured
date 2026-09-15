@@ -100,8 +100,9 @@ class ResearchLedgerTests(unittest.TestCase):
         self.assertIsNone(self.ledger.report()['metrics']['ending_virtual_capital'])
 
     def test_confirmed_assignment_keeps_capital_and_marks_stock(self):
-        self.entry()
-        day=date.today().isoformat()
+        with patch('analytics.now_iso', return_value='2026-09-14T16:00:00+00:00'):
+            self.entry()
+        day='2026-09-14'
         activity=dict(id='assignment1',symbol=self.c.symbol,qty=1,date=day,activity_type='OPASN',status='executed')
         self.assertFalse(self.ledger.settlement(activity))
         stock=dict(symbol='IWM',qty=100,price=175,date=day,activity_type='OPTRD',status='executed')

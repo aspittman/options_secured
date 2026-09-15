@@ -1,6 +1,8 @@
+from runtime_performance import report_cycle
+from cycle_performance import atomic_json
 """Five-minute paper loop, daily entries, continuously monitored exits."""
 import argparse
-import fcntl
+import process_lock as fcntl
 import json
 from pathlib import Path
 import time
@@ -14,6 +16,7 @@ from oasis import refresh_oasis_data, get_oasis_signal_state, entry_window
 
 
 def cycle(cfg, broker, trader):
+    trader.cycle_marks = {}
     healthy = trader.reconcile()
     clock = broker.trading.get_clock()
     if not clock.is_open:
@@ -23,10 +26,11 @@ def cycle(cfg, broker, trader):
     if hasattr(broker, 'stocks') and hasattr(broker, 'trading'):
         refresh_oasis_data(cfg.underlyings, broker.stocks, broker.trading, clock.timestamp)
     marks = trader.manage_exits()
+    trader.cycle_marks = marks
     trader.ledger.record_equity(marks,cfg)
     report=trader.ledger.report(marks,cfg.virtual_starting_capital)
     bot_log(json.dumps(report))
-    Path(cfg.db_path).with_name('performance_summary.json').write_text(json.dumps(report,indent=2))
+    atomic_json(Path(cfg.db_path).with_name('performance_summary.json'), report)
     trader.ledger.export()
     if not cfg.enable_entries or not healthy or not cancellations_ok:
         return
@@ -95,6 +99,8 @@ def run_bot(once=False):
                     bot_log(f"Cycle unavailable: {exc}")
                     if once:
                         raise
+                finally:
+                    report_cycle(trader)
                 if once:
                     return
                 time.sleep(min(cfg.scan_seconds, 60))
