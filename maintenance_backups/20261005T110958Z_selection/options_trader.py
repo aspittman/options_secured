@@ -3,7 +3,6 @@ from dataclasses import dataclass, replace
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING
-from selection import volume_status
 import math
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -231,7 +230,7 @@ class AlpacaBroker:
         if sink:
             sink(reason, candidate, **details)
 
-    def candidates(self, underlying, max_collateral=None):
+    def candidates(self, underlying):
         cfg = self.cfg
         today = datetime.now(NY).date()
         latest = self.stocks.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=underlying, feed=DataFeed.IEX))[underlying]
@@ -255,19 +254,8 @@ class AlpacaBroker:
             request.page_token = response.next_page_token
         eligible = []
         rejected = Counter()
-        ceiling = min(cfg.max_collateral_per_trade, cfg.max_total_collateral,
-                          cfg.virtual_starting_capital,
-                          cfg.virtual_starting_capital if max_collateral is None else max_collateral)
         for contract in contracts:
             strike = float(contract.strike_price)
-            if not math.isfinite(strike) or strike <= 0 or strike * 100 > ceiling:
-                self.reject_candidate("COLLATERAL_OVER_LIMIT",
-                    Candidate(contract.symbol, underlying, strike, contract.expiration_date, 0, 0, underlying_price=spot),
-                    details=f"preselection collateral limit={ceiling}")
-                continue
-            if volume_status(getattr(contract, 'open_interest', None), cfg.min_open_interest) == 'volume_data_unavailable':
-                self.reject_candidate("OTHER", details=f"open_interest_data_unavailable:{contract.symbol}")
-                continue
             if (contract.tradable and str(getattr(contract.type, "value", contract.type)) == "put"
                 and float(contract.size or 0) == 100 and contract.root_symbol == underlying
                 and 0 < strike < spot
@@ -290,13 +278,7 @@ class AlpacaBroker:
                 snap = snapshots.get(contract.symbol)
                 quote = getattr(snap, "latest_quote", None)
                 delta = getattr(getattr(snap, "greeks", None), "delta", None)
-                bars = volumes.get(contract.symbol)
-                volume = (sum(float(b.volume) for b in bars)
-                          if bars and all(volume_status(b.volume, 0) == '' for b in bars) else None)
-                status = volume_status(volume, cfg.min_volume)
-                if status == 'volume_data_unavailable':
-                    self.reject_candidate("OTHER", details=f"volume_data_unavailable:{contract.symbol}")
-                    continue
+                volume = sum(float(b.volume) for b in volumes.get(contract.symbol, []))
                 raw = Candidate(contract.symbol, underlying, float(contract.strike_price), contract.expiration_date,
                     float(getattr(quote,'bid_price',0) or 0), float(getattr(quote,'ask_price',0) or 0), underlying_price=spot)
                 if not valid_quote(quote, cfg.quote_max_age):

@@ -135,25 +135,24 @@ class ResearchLedgerTests(unittest.TestCase):
 
 
 class SelectionTests(unittest.TestCase):
-    def test_select_affordable_candidate_before_attempting_entry(self):
+    def test_no_cheaper_fallback_after_preferred_rejection(self):
         frame=pd.DataFrame({'close':[300]},index=pd.DatetimeIndex(['2026-09-09']))
         broker=NS(trading=NS(get_clock=lambda:NS(is_open=True, timestamp=datetime.now(timezone.utc),
                       next_close=datetime.now(timezone.utc)+timedelta(hours=2))),history=lambda s:frame,
-                  candidates=lambda s, **kw:[contract(300),contract(175),contract(150)])
+                  candidates=lambda s:[contract(300),contract(175)])
         from unittest.mock import Mock
         trader=Mock()
         trader.reconcile.return_value=True
         trader.manage_exits.return_value={}
         trader.ledger.report.return_value={}
         trader.enter.return_value=False
-        trader.entry_capacity.side_effect=lambda c: (c.strike <= 250, 'COLLATERAL_OVER_LIMIT')
         trader.ledger.traded_bar.return_value=False
         with patch('main.regime_at',return_value=True),patch('main.entry_at',return_value=True),patch('main.bot_log'):
             cycle(replace(Settings(),underlyings=('IWM',),enable_entries=True),broker,trader)
         trader.enter.assert_called_once()
-        self.assertEqual(trader.enter.call_args.args[0].strike,175)
+        self.assertEqual(trader.enter.call_args.args[0].strike,300)
 
-    def test_candidate_ranking_prefilters_capital(self):
+    def test_candidate_ranking_does_not_prefilter_capital(self):
         c=contract(300)
         broker=AlpacaBroker.__new__(AlpacaBroker)
         broker.cfg=Settings(); broker.feed='indicative'
@@ -164,7 +163,7 @@ class SelectionTests(unittest.TestCase):
         broker.options=NS(get_option_snapshot=lambda r:{c.symbol:snapshot},get_option_bars=lambda r:NS(data={c.symbol:[NS(volume=200)]}))
         with patch('options_trader.bot_log'):
             ranked=broker.candidates('IWM')
-        self.assertEqual(ranked,[])
+        self.assertEqual(ranked[0].strike,300)
 
     def test_adapter_rejects_calls_and_multiple_contracts(self):
         b=AlpacaBroker.__new__(AlpacaBroker)

@@ -55,16 +55,9 @@ def cycle(cfg, broker, trader):
             variant, signal_date = eligible[0]
             broker.rejection_sink=lambda reason,candidate=None,**details: trader.ledger.reject(
                 reason,candidate,cfg,underlying=underlying,variant=variant,signal_date=signal_date,**details)
-            candidates=broker.candidates(underlying, max_collateral=trader.ledger.available(cfg))
+            candidates=broker.candidates(underlying)
             if candidates:
-                # Skip unaffordable/blocked candidates before any submission.
-                # Never try another contract after enter(): a submission may be uncertain.
-                for candidate in candidates:
-                    allowed, reason = trader.entry_capacity(candidate)
-                    if allowed:
-                        trader.enter(candidate,variant,signal_date)
-                        break
-                    trader.reject(reason,candidate,variant,signal_date,"preselection capacity check")
+                trader.enter(candidates[0],variant,signal_date)
             else:
                 trader.ledger.reject('NO_VALID_CONTRACT',cfg=cfg,underlying=underlying,
                                     variant=variant,signal_date=signal_date)

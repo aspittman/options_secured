@@ -28,7 +28,7 @@ class Settings:
     target_delta: float = -0.25
     delta_tolerance: float = 0.10
     min_open_interest: int = 500
-    min_volume: int = 50
+    min_volume: int = 100
     max_spread: float = 0.10
     min_credit_yield: float = 0.005
     virtual_starting_capital: float = 25000
